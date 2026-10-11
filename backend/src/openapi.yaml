@@ -1,0 +1,433 @@
+openapi: 3.0.3
+info:
+  title: TierForge API
+  version: 1.0.0
+  description: |
+    Bulk store enrichment, scoring and tiering.
+
+    - Upload a CSV to create a job; a separate worker process enriches the stores.
+    - Scoring runs in SQL over already-enriched data and never calls the enrichment API.
+    - Database `BIGSERIAL` ids (job ids, config ids) are serialised as **strings** (e.g. `"1"`).
+servers:
+  - url: http://localhost:8000
+    description: Default local port (set PORT in .env to change)
+tags:
+  - name: Jobs
+  - name: Scoring
+  - name: Dashboard
+  - name: System
+
+paths:
+  /health:
+    get:
+      tags: [System]
+      summary: Liveness check (does not touch the database)
+      responses:
+        '200':
+          description: API process is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /api/jobs:
+    post:
+      tags: [Jobs]
+      summary: Upload a stores CSV and create an enrichment job
+      description: |
+        Validates the whole file first (headers, rows). If anything is invalid nothing is written.
+        On success the job, its stores and its enrichment work units are created in one
+        transaction and the call returns immediately; the worker picks the job up on its own.
+
+        Required header columns (exact names, any order, no extras, no duplicates):
+        `store_id, store_name, address, city, state, country`. Max file size 5 MB, `.csv` only.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: CSV file (field name must be `file`, filename must end in `.csv`)
+      responses:
+        '201':
+          description: Job created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string, example: '1' }
+                  total: { type: integer, example: 5000 }
+                  status: { type: string, enum: [PENDING] }
+        '400':
+          description: |
+            Validation failure. `error.code` is one of: `NO_FILE`, `INVALID_FILE_TYPE`, `EMPTY_FILE`,
+            `INVALID_CSV`, `INVALID_HEADERS`, `NO_ROWS`, `INVALID_ROWS`, `UPLOAD_ERROR`.
+            Duplicate `store_id`s are reported as `INVALID_ROWS` (there is no separate duplicate code).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                invalidHeaders:
+                  summary: Missing, unexpected or duplicated header columns
+                  value:
+                    error:
+                      code: INVALID_HEADERS
+                      message: 'Invalid CSV headers (missing: country; unexpected: zip)'
+                      details:
+                        - { field: country, problem: missing }
+                        - { field: zip, problem: unexpected }
+                invalidRows:
+                  summary: Blank required values and duplicate store_id (first 10 problems, with row numbers; row 1 is the header)
+                  value:
+                    error:
+                      code: INVALID_ROWS
+                      message: 'CSV has invalid rows (showing first 2)'
+                      details:
+                        - { row: 3, message: store_name is required }
+                        - { row: 4, message: 'duplicate store_id "S1" (first seen on row 2)' }
+                noFile:
+                  value:
+                    error: { code: NO_FILE, message: 'Attach a CSV file in the "file" field', details: [] }
+                wrongType:
+                  value:
+                    error: { code: INVALID_FILE_TYPE, message: Only .csv files are accepted, details: [] }
+                emptyFile:
+                  value:
+                    error: { code: EMPTY_FILE, message: The uploaded file is empty, details: [] }
+                noRows:
+                  value:
+                    error: { code: NO_ROWS, message: The file contains a header but no data rows, details: [] }
+        '413':
+          description: File larger than 5 MB
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error: { code: FILE_TOO_LARGE, message: File too large, details: [] }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/jobs/{id}:
+    get:
+      tags: [Jobs]
+      summary: Live job progress
+      description: Counts are computed live from the enrichment table (no stored counters).
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Job progress
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobProgress' }
+        '404': { $ref: '#/components/responses/JobNotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/jobs/{id}/failures:
+    get:
+      tags: [Jobs]
+      summary: Stores that ultimately failed enrichment, with reasons
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Paginated failures plus a grouped summary of error reasons (summary covers all pages)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FailuresPage' }
+        '404': { $ref: '#/components/responses/JobNotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/jobs/{id}/scoring:
+    post:
+      tags: [Scoring]
+      summary: Save a scoring configuration and score every enriched store
+      description: |
+        Inserts a new `scoring_configs` row (history is kept) and scores all stores whose enrichment is
+        `SUCCESS` so far, in one SQL statement. Does not call the enrichment API. Can be re-run any time,
+        also while enrichment is still running; stores not yet enriched stay unscored.
+
+        `score` = sum of the weights of the bars a store meets (`>=`, inclusive).
+        Tier: `score >= large_threshold` → Large; `score >= medium_threshold` → Medium; else Small.
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScoringRequest' }
+            example:
+              footfall_bar: 15000
+              footfall_weight: 50
+              revenue_bar: 150000
+              revenue_weight: 30
+              size_bar: 8000
+              size_weight: 20
+              large_threshold: 70
+              medium_threshold: 40
+      responses:
+        '201':
+          description: Scoring run completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  config_id: { type: string, example: '1' }
+                  tiers: { $ref: '#/components/schemas/TierCounts' }
+                  duration_ms: { type: integer, example: 34 }
+        '400':
+          description: |
+            `INVALID_SCORING_CONFIG`; `error.details` is a list of `{field, message}`. Fields must be present and numeric;
+            weights integers 0–100 summing to exactly 100 (reported under field `weights`); bars `>= 0`
+            (footfall/size integers); thresholds integers 0–100 with `medium_threshold <= large_threshold`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: INVALID_SCORING_CONFIG
+                  message: Invalid scoring configuration
+                  details:
+                    - { field: weights, message: weights must sum to 100 (got 85) }
+        '404': { $ref: '#/components/responses/JobNotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/jobs/{id}/dashboard:
+    get:
+      tags: [Dashboard]
+      summary: Progress, latest scoring config and tier breakdown in one call
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Dashboard summary. `config` is null until scoring has been run.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  progress: { $ref: '#/components/schemas/JobProgress' }
+                  config:
+                    nullable: true
+                    allOf:
+                      - $ref: '#/components/schemas/ScoringConfig'
+                  tiers: { $ref: '#/components/schemas/TierCounts' }
+        '404': { $ref: '#/components/responses/JobNotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/jobs/{id}/stores:
+    get:
+      tags: [Dashboard]
+      summary: Filterable, sortable, paginated store list with metrics, score and tier
+      description: Score and tier come from the job's latest scoring config; they are null until scoring has run.
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+        - name: tier
+          in: query
+          schema: { type: string, enum: [All, Large, Medium, Small, unscored] }
+          description: '`All` or omitted = no filter; `unscored` = stores without a score row'
+        - name: status
+          in: query
+          schema: { type: string, enum: [All, PENDING, IN_PROGRESS, SUCCESS, FAILED] }
+          description: Enrichment status; `All` or omitted = no filter
+        - name: q
+          in: query
+          schema: { type: string }
+          description: Case-insensitive substring match on store name
+        - name: sort
+          in: query
+          schema: { type: string, default: 'store_id:asc', example: 'score:desc' }
+          description: |
+            `<column>:<asc|desc>`. Columns: store_name, store_id, city, state, footfall, revenue,
+            size_sqft, score, tier, status. An unknown column falls back to `store_id`; nulls sort last.
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: One page of stores
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StoresPage' }
+        '400':
+          description: '`INVALID_FILTER` for an unknown `tier` or `status` value'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: INVALID_FILTER
+                  message: tier must be Large, Medium, Small or unscored
+                  details: []
+        '404': { $ref: '#/components/responses/JobNotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+components:
+  parameters:
+    JobId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+      description: Job id (a non-numeric or non-positive id returns 404 `JOB_NOT_FOUND`)
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: pageSize
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      description: Values above 200 are clamped to 200
+
+  responses:
+    JobNotFound:
+      description: Unknown or invalid job id
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: JOB_NOT_FOUND, message: Job 9999 not found, details: [] }
+    InternalError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: INTERNAL_ERROR, message: Unexpected server error, details: [] }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: INVALID_HEADERS }
+            message: { type: string }
+            details:
+              type: array
+              description: Shape depends on the code (`{field, problem}`, `{row, message}` or `{field, message}`)
+              items: { type: object, additionalProperties: true }
+
+    JobProgress:
+      type: object
+      properties:
+        id: { type: string, example: '1' }
+        filename: { type: string, example: stores_5000.csv }
+        status:
+          type: string
+          enum: [PENDING, RUNNING, PAUSED, COMPLETED, COMPLETED_WITH_FAILURES, FAILED]
+          description: |
+            PAUSED = circuit breaker tripped, worker is probing the enrichment API and resumes automatically.
+            FAILED = no recovery within the pause limit.
+        failure_reason: { type: string, nullable: true, description: Set while PAUSED and when FAILED }
+        total: { type: integer, example: 5000 }
+        counts:
+          type: object
+          properties:
+            PENDING: { type: integer }
+            IN_PROGRESS: { type: integer }
+            SUCCESS: { type: integer }
+            FAILED: { type: integer }
+        failed: { type: integer, description: Same as counts.FAILED }
+        percent_complete:
+          type: number
+          description: (SUCCESS + FAILED) / total × 100, one decimal
+          example: 13.6
+        created_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+
+    FailuresPage:
+      type: object
+      properties:
+        page: { type: integer }
+        pageSize: { type: integer }
+        total: { type: integer, description: Total failed stores }
+        summary:
+          type: array
+          items:
+            type: object
+            properties:
+              error: { type: string, example: 'rate limited (429)' }
+              count: { type: integer }
+        failures:
+          type: array
+          items:
+            type: object
+            properties:
+              store_id: { type: string }
+              store_name: { type: string }
+              attempts: { type: integer }
+              last_error: { type: string, nullable: true }
+
+    ScoringRequest:
+      type: object
+      required:
+        - footfall_bar
+        - footfall_weight
+        - revenue_bar
+        - revenue_weight
+        - size_bar
+        - size_weight
+        - large_threshold
+        - medium_threshold
+      properties:
+        footfall_bar: { type: integer, minimum: 0 }
+        footfall_weight: { type: integer, minimum: 0, maximum: 100 }
+        revenue_bar: { type: number, minimum: 0 }
+        revenue_weight: { type: integer, minimum: 0, maximum: 100 }
+        size_bar: { type: integer, minimum: 0 }
+        size_weight: { type: integer, minimum: 0, maximum: 100 }
+        large_threshold: { type: integer, minimum: 0, maximum: 100 }
+        medium_threshold: { type: integer, minimum: 0, maximum: 100 }
+
+    ScoringConfig:
+      allOf:
+        - $ref: '#/components/schemas/ScoringRequest'
+        - type: object
+          properties:
+            id: { type: string, example: '1' }
+            job_id: { type: string, example: '1' }
+            created_at: { type: string, format: date-time }
+
+    TierCounts:
+      type: object
+      properties:
+        Large: { type: integer }
+        Medium: { type: integer }
+        Small: { type: integer }
+        unscored: { type: integer, description: Stores without a score (not enriched yet, or failed) }
+
+    StoresPage:
+      type: object
+      properties:
+        page: { type: integer }
+        pageSize: { type: integer }
+        total: { type: integer, description: Rows matching the filters }
+        stores:
+          type: array
+          items:
+            type: object
+            properties:
+              store_id: { type: string }
+              store_name: { type: string }
+              city: { type: string }
+              state: { type: string }
+              status: { type: string, enum: [PENDING, IN_PROGRESS, SUCCESS, FAILED] }
+              footfall: { type: integer, nullable: true }
+              revenue: { type: number, nullable: true }
+              size_sqft: { type: integer, nullable: true }
+              last_error: { type: string, nullable: true }
+              score: { type: integer, nullable: true }
+              tier: { type: string, enum: [Large, Medium, Small], nullable: true }
